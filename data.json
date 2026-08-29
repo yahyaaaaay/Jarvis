@@ -1,0 +1,6 @@
+{
+  "personal": { "tasks": [], "goals": [] },
+  "university": { "courses": [], "notes": [] },
+  "work": { "projects": [], "notes": [] },
+  "memory": { "facts": [] }
+}

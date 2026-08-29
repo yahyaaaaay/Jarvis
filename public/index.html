@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Yahya's Jarvis</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="scanlines"></div>
+  <div class="toast-stack" id="toastStack"></div>
+
+  <header class="topbar">
+    <div class="brand">YAHYA'S <span>JARVIS</span></div>
+    <div class="status" id="status">Standing by, Sir Yahya.</div>
+  </header>
+
+  <main class="layout">
+    <!-- PERSONAL -->
+    <section class="panel" data-domain="personal">
+      <h2>Personal</h2>
+      <div class="subhead">Tasks</div>
+      <form class="add-row task-row" id="taskForm">
+        <input type="text" id="taskInput" placeholder="Add a task..." autocomplete="off" />
+        <input type="date" id="taskDate" title="Due date (optional)" />
+        <select id="taskPriority" title="Priority">
+          <option value="normal">Normal</option>
+          <option value="low">Low</option>
+          <option value="high">High</option>
+        </select>
+        <button type="submit">+</button>
+      </form>
+      <ul class="list" id="taskList"></ul>
+
+      <div class="subhead">Goals</div>
+      <form class="add-row" id="goalForm">
+        <input type="text" id="goalInput" placeholder="Add a goal..." autocomplete="off" />
+        <button type="submit">+</button>
+      </form>
+      <ul class="list plain" id="goalList"></ul>
+
+      <div class="subhead memory-head">🧠 Memory <span id="memCount" class="mem-count"></span></div>
+      <ul class="list plain memory-list" id="memoryList"></ul>
+    </section>
+
+    <!-- CENTER: AI AGENT -->
+    <div class="core-column">
+      <div class="core-wrap" id="coreWrap">
+        <svg class="core" viewBox="0 0 300 300" id="core">
+          <circle class="ring ring-1" cx="150" cy="150" r="130" />
+          <circle class="ring ring-2" cx="150" cy="150" r="105" />
+          <circle class="ring ring-3" cx="150" cy="150" r="80" />
+          <circle class="ring ring-4" cx="150" cy="150" r="55" />
+          <circle class="core-fill" cx="150" cy="150" r="42" />
+        </svg>
+        <div class="bars" id="bars"></div>
+      </div>
+      <div class="agent-label">AI AGENT</div>
+      <button class="power-btn" id="powerBtn"><span id="powerLabel">ENGAGE</span></button>
+      <button class="wake-btn" id="wakeBtn" title="Listen for the word 'Jarvis' to auto-engage (uses your browser's speech recognition)">WAKE WORD: OFF</button>
+      <div class="transcript" id="transcript"></div>
+    </div>
+
+    <!-- UNIVERSITY -->
+    <section class="panel" data-domain="university">
+      <h2>University</h2>
+      <div class="subhead">Courses</div>
+      <form class="add-row" id="courseForm">
+        <input type="text" id="courseInput" placeholder="Add a course..." autocomplete="off" />
+        <button type="submit">+</button>
+      </form>
+      <ul class="list plain" id="courseList"></ul>
+      <div class="subhead">Notes</div>
+      <ul class="list plain" id="uniNoteList"></ul>
+    </section>
+  </main>
+
+  <section class="panel panel-wide" data-domain="work">
+    <h2>Work</h2>
+    <div class="subhead">Projects</div>
+    <form class="add-row" id="projectForm">
+      <input type="text" id="projectInput" placeholder="Add a project..." autocomplete="off" />
+      <button type="submit">+</button>
+    </form>
+    <ul class="list plain" id="projectList"></ul>
+    <div class="subhead">Notes</div>
+    <ul class="list plain" id="workNoteList"></ul>
+  </section>
+
+  <script src="app.js"></script>
+</body>
+</html>
