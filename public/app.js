@@ -202,7 +202,11 @@ async function startJarvis({ silentBriefing = false } = {}) {
 
   try {
     const tokenRes = await fetch("/session");
-    if (!tokenRes.ok) throw new Error("Could not create session");
+    if (!tokenRes.ok) {
+      const errText = await tokenRes.text().catch(() => "");
+      console.error("Session request failed:", tokenRes.status, errText);
+      throw new Error("Could not create session — " + (errText || ("HTTP " + tokenRes.status)));
+    }
     const sessionData = await tokenRes.json();
     const ephemeralKey = sessionData.value;
 
@@ -408,10 +412,32 @@ function startWakeWordListening() {
       startJarvis();
     }
   };
-  wakeRecognition.onerror = () => { /* mic permission issues, transient network errors — just let onend restart it */ };
+  wakeRecognition.onerror = (e) => {
+    // Chrome throws 'not-allowed' (mic permission denied/blocked) or 'audio-capture'
+    // (no mic found) — these are NOT transient and will never self-heal by restarting.
+    // Surface them instead of silently retrying forever.
+    if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+      wakeWordEnabled = false;
+      wakeBtn.classList.remove('active');
+      wakeBtn.textContent = 'WAKE WORD: OFF';
+      toast('Mic access blocked for Wake Word — allow the microphone for this site in Chrome (click the lock icon in the address bar) and turn it back on.', 'error');
+      return;
+    }
+    if (e.error === 'audio-capture') {
+      toast('No microphone found — Wake Word needs mic access.', 'error');
+      return;
+    }
+    // 'network' / 'no-speech' / 'aborted' etc. — transient, let onend restart it below.
+  };
   wakeRecognition.onend = () => {
     if (wakeWordEnabled && !isActive) {
-      try { wakeRecognition.start(); } catch { /* already running */ }
+      // Chrome throttles/ignores a .start() called immediately inside onend
+      // (it can silently stop restarting after a few cycles) — a short delay fixes it.
+      setTimeout(() => {
+        if (wakeWordEnabled && !isActive) {
+          try { wakeRecognition.start(); } catch { /* already running */ }
+        }
+      }, 250);
     }
   };
 
