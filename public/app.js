@@ -7,13 +7,14 @@ const coreWrap = document.getElementById("coreWrap");
 const barsEl = document.getElementById("bars");
 const toastStack = document.getElementById("toastStack");
 
-let pc = null;
-let dc = null;
 let micStream = null;
-let audioEl = null;
 let isActive = false;
 let lastActivity = Date.now();
 const AUTO_DISENGAGE_MS = 5 * 60 * 1000; // 5 minutes of silence
+
+let convoRecognition = null;
+let awaitingReply = false; // true from "user stopped talking" until Jarvis has finished replying
+let conversationHistory = []; // {role, content} turns sent to /chat for context, trimmed to last 20
 
 // ---- voice-reactive bars ----
 const BAR_COUNT = 24;
@@ -194,60 +195,36 @@ document.getElementById("projectForm").addEventListener("submit", async (e) => {
 refreshDashboard();
 
 // ============ VOICE ENGINE ============
+// Free version: the browser's own Speech-to-Text listens for what Sir Yahya says, the text
+// goes to our /chat endpoint (Groq's free-tier API does the thinking + tool calls), and the
+// browser's own Text-to-Speech reads the reply back out loud. No paid voice API involved.
 async function startJarvis({ silentBriefing = false } = {}) {
   if (isActive) return;
+  if (!supportsWakeWord()) {
+    toast("Voice needs Chrome or Edge — not supported in this browser.", "error");
+    return;
+  }
   setStatus("Initializing systems...");
   powerBtn.disabled = true;
-  stopWakeWordListening(); // don't run wake-word recognition and the real mic connection at once
+  stopWakeWordListening(); // don't run wake-word recognition and the real conversation loop at once
 
   try {
-    const tokenRes = await fetch("/session");
-    if (!tokenRes.ok) {
-      const errText = await tokenRes.text().catch(() => "");
-      console.error("Session request failed:", tokenRes.status, errText);
-      throw new Error("Could not create session — " + (errText || ("HTTP " + tokenRes.status)));
-    }
-    const sessionData = await tokenRes.json();
-    const ephemeralKey = sessionData.value;
-
-    pc = new RTCPeerConnection();
-    audioEl = document.createElement("audio");
-    audioEl.autoplay = true;
-    pc.ontrack = (e) => { audioEl.srcObject = e.streams[0]; };
-
     micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    pc.addTrack(micStream.getTracks()[0]);
     setupMicVisualizer(micStream);
-
-    dc = pc.createDataChannel("oai-events");
-    dc.addEventListener("message", handleServerEvent);
-    dc.addEventListener("open", () => {
-      setStatus("Online. Listening, Sir Yahya.");
-      coreWrap.classList.add("listening");
-      lastActivity = Date.now();
-      maybeSendDailyBriefing();
-    });
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    const sdpResponse = await fetch("https://api.openai.com/v1/realtime/calls", {
-      method: "POST",
-      body: offer.sdp,
-      headers: { Authorization: `Bearer ${ephemeralKey}`, "Content-Type": "application/sdp" },
-    });
-    if (!sdpResponse.ok) throw new Error("Realtime handshake failed");
-
-    const answerSdp = await sdpResponse.text();
-    await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
 
     isActive = true;
     powerBtn.classList.add("active");
     powerLabel.textContent = "DISENGAGE";
+    setStatus("Online. Listening, Sir Yahya.");
+    coreWrap.classList.add("listening");
+    lastActivity = Date.now();
+
+    startConvoRecognition();
+    maybeSendDailyBriefing();
   } catch (err) {
     console.error(err);
     setStatus("Startup failed — check console.");
-    toast("Jarvis failed to connect — check the console for details.", "error");
+    toast("Jarvis needs microphone access to start — check the console for details.", "error");
     stopJarvis();
   } finally {
     powerBtn.disabled = false;
@@ -255,10 +232,10 @@ async function startJarvis({ silentBriefing = false } = {}) {
 }
 
 function stopJarvis(reason) {
-  if (dc) dc.close();
-  if (pc) pc.close();
+  stopConvoRecognition();
+  speechSynthesis.cancel();
   if (micStream) micStream.getTracks().forEach((t) => t.stop());
-  pc = null; dc = null; micStream = null; isActive = false;
+  micStream = null; isActive = false; awaitingReply = false;
   coreWrap.classList.remove("listening", "speaking");
   powerBtn.classList.remove("active");
   powerLabel.textContent = "ENGAGE";
@@ -276,47 +253,147 @@ setInterval(() => {
   }
 }, 15000);
 
+// ---- One utterance at a time: listen for a sentence, stop, send it, speak the reply, repeat ----
+function startConvoRecognition() {
+  if (!isActive) return;
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  convoRecognition = new SpeechRecognition();
+  convoRecognition.continuous = false;
+  convoRecognition.interimResults = false;
+  convoRecognition.lang = "en-US";
+
+  convoRecognition.onresult = (e) => {
+    const transcript = Array.from(e.results).map((r) => r[0].transcript).join(" ").trim();
+    if (transcript) handleUserSpeech(transcript);
+  };
+  convoRecognition.onerror = (e) => {
+    if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+      toast("Microphone access blocked — allow the mic for this site in Chrome, then click ENGAGE again.", "error");
+      stopJarvis();
+      return;
+    }
+    // 'no-speech' / 'aborted' etc. are routine here (continuous=false stops after each pause) —
+    // onend below restarts listening regardless.
+  };
+  convoRecognition.onend = () => {
+    convoRecognition = null;
+    if (isActive && !awaitingReply) {
+      // Small delay avoids Chrome silently throttling an immediate restart.
+      setTimeout(() => { if (isActive && !awaitingReply) startConvoRecognition(); }, 250);
+    }
+  };
+
+  try { convoRecognition.start(); } catch { /* already running */ }
+}
+
+function stopConvoRecognition() {
+  if (convoRecognition) {
+    convoRecognition.onend = null;
+    convoRecognition.onresult = null;
+    try { convoRecognition.stop(); } catch { /* not running */ }
+    convoRecognition = null;
+  }
+}
+
+async function handleUserSpeech(transcript) {
+  lastActivity = Date.now();
+  awaitingReply = true;
+  stopConvoRecognition();
+  logLine("you", transcript);
+  coreWrap.classList.remove("listening");
+  setStatus("Thinking, Sir Yahya...");
+
+  const reply = await sendToJarvis(transcript);
+  speakReply(reply);
+}
+
+// Sends one turn to the server's /chat endpoint (Groq, free tier) and updates the running
+// conversation history so follow-up questions keep context.
+async function sendToJarvis(message) {
+  try {
+    const res = await fetch("/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message, history: conversationHistory }),
+    });
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      console.error("Chat request failed:", res.status, errText);
+      throw new Error("Chat request failed — " + (errText || ("HTTP " + res.status)));
+    }
+    const data = await res.json();
+    conversationHistory.push({ role: "user", content: message });
+    conversationHistory.push({ role: "assistant", content: data.reply });
+    conversationHistory = conversationHistory.slice(-20);
+    return data.reply;
+  } catch (err) {
+    console.error(err);
+    toast("Jarvis couldn't reach the server — check the console.", "error");
+    return "Apologies, Sir Yahya — I couldn't reach my server just now.";
+  }
+}
+
+function speakReply(text) {
+  logLine("jarvis", text);
+  lastActivity = Date.now();
+  coreWrap.classList.add("speaking");
+  setStatus("Speaking, Sir Yahya.");
+
+  speechSynthesis.cancel();
+  const utter = new SpeechSynthesisUtterance(text);
+  utter.lang = "en-US";
+  const voice = pickVoice();
+  if (voice) utter.voice = voice;
+
+  utter.onend = () => {
+    awaitingReply = false;
+    coreWrap.classList.remove("speaking");
+    if (isActive) {
+      coreWrap.classList.add("listening");
+      setStatus("Online. Listening, Sir Yahya.");
+      startConvoRecognition();
+    }
+  };
+  utter.onerror = () => {
+    awaitingReply = false;
+    if (isActive) startConvoRecognition();
+  };
+
+  speechSynthesis.speak(utter);
+}
+
+// Prefer a clearer male English voice for the "Jarvis" feel, when the browser offers one.
+let cachedVoice = null;
+function pickVoice() {
+  if (cachedVoice) return cachedVoice;
+  const voices = speechSynthesis.getVoices();
+  cachedVoice =
+    voices.find((v) => /Daniel|Google UK English Male|Male/i.test(v.name) && v.lang.startsWith("en")) ||
+    voices.find((v) => v.lang === "en-GB") ||
+    voices.find((v) => v.lang.startsWith("en")) ||
+    null;
+  return cachedVoice;
+}
+if (typeof speechSynthesis !== "undefined") {
+  speechSynthesis.onvoiceschanged = () => { cachedVoice = null; };
+}
+
 // ---- Daily briefing: once per calendar day, on first engage ----
 function maybeSendDailyBriefing() {
   const today = new Date().toISOString().slice(0, 10);
   const last = localStorage.getItem("jarvis_last_briefing");
   if (last === today) return;
   localStorage.setItem("jarvis_last_briefing", today);
-  setTimeout(() => {
-    if (!dc || dc.readyState !== "open") return;
-    dc.send(JSON.stringify({
-      type: "conversation.item.create",
-      item: { type: "message", role: "user", content: [{ type: "input_text", text: "(Automatic daily check-in) Give me a brief morning briefing — check my tasks and mention anything overdue or due today, plus any open goals or projects worth flagging. Keep it short." }] },
-    }));
-    dc.send(JSON.stringify({ type: "response.create" }));
+  setTimeout(async () => {
+    if (!isActive) return;
+    awaitingReply = true;
+    stopConvoRecognition();
+    setStatus("Thinking, Sir Yahya...");
+    const reply = await sendToJarvis(
+      "(Automatic daily check-in) Give me a brief morning briefing — check my tasks and mention anything overdue or due today, plus any open goals or projects worth flagging. Keep it short."
+    );
+    speakReply(reply);
   }, 600);
-}
-
-async function handleServerEvent(e) {
-  const event = JSON.parse(e.data);
-  lastActivity = Date.now();
-  switch (event.type) {
-    case "input_audio_buffer.speech_started":
-      coreWrap.classList.remove("speaking"); coreWrap.classList.add("listening");
-      break;
-    case "response.output_audio.delta":
-      coreWrap.classList.remove("listening"); coreWrap.classList.add("speaking");
-      break;
-    case "response.done":
-      coreWrap.classList.remove("speaking"); coreWrap.classList.add("listening");
-      break;
-    case "conversation.item.input_audio_transcription.completed":
-      logLine("you", event.transcript);
-      break;
-    case "response.output_audio_transcript.done":
-      logLine("jarvis", event.transcript);
-      break;
-    case "response.output_item.done":
-      if (event.item?.type === "function_call") await handleVoiceToolCall(event.item);
-      break;
-    default:
-      break;
-  }
 }
 
 const DATA_TOOLS = ["add_task", "complete_task", "update_task", "delete_task", "add_goal", "add_course", "add_note", "add_project", "add_work_note", "remember_fact"];
@@ -326,20 +403,6 @@ const TOOL_LABELS = {
   add_goal: "Goal added", add_course: "Course added", add_note: "Note added", add_project: "Project added",
   add_work_note: "Note added", remember_fact: "Remembered",
 };
-
-async function handleVoiceToolCall(item) {
-  const result = await runTool(item.name, safeParse(item.arguments));
-  dc.send(JSON.stringify({
-    type: "conversation.item.create",
-    item: { type: "function_call_output", call_id: item.call_id, output: JSON.stringify(result) },
-  }));
-  dc.send(JSON.stringify({ type: "response.create" }));
-  setStatus("Online. Listening, Sir Yahya.");
-}
-
-function safeParse(raw) {
-  try { return JSON.parse(raw || "{}"); } catch { return {}; }
-}
 
 // Shared by both voice tool calls and the dashboard's own "+" buttons
 async function runTool(name, args) {

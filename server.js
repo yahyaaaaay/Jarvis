@@ -13,10 +13,14 @@ const DATA_PATH = path.join(__dirname, "data.json");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
 
-if (!OPENAI_API_KEY) {
-  console.error("\n❌ Missing OPENAI_API_KEY in .env — Jarvis can't wake up without it.\n");
+if (!GROQ_API_KEY) {
+  console.error(
+    "\n❌ Missing GROQ_API_KEY in .env — Jarvis can't think without it.\n" +
+    "Get a free key (no credit card needed) at https://console.groq.com/keys and add it to .env\n"
+  );
   process.exit(1);
 }
 
@@ -105,6 +109,7 @@ Personality:
 - Tasks can have a due date and a priority (low/normal/high) — mention these when relevant, e.g. flag anything overdue or due today.
 - If Sir Yahya tells you something worth remembering long-term (a preference, a recurring detail about his life), proactively call remember_fact.
 - If you don't know something and have no tool for it, say so plainly.
+- Your replies are read aloud by text-to-speech. Respond in plain spoken sentences only — never use markdown, bullet points, numbered lists, or asterisks.
 Never break character or mention you are a language model unless directly asked.
 `.trim();
 
@@ -285,42 +290,79 @@ async function executeTool(name, args) {
   }
 }
 
-// Mint an ephemeral client token — instructions include remembered facts, turn detection tuned for snappier replies
-app.get("/session", async (req, res) => {
+// Groq wants the standard OpenAI chat-tools shape ({type, function:{name, description, parameters}});
+// our TOOLS array is kept in the flatter shape above so it doubles as a single source of truth.
+const GROQ_TOOLS = TOOLS.map((t) => ({
+  type: "function",
+  function: { name: t.name, description: t.description, parameters: t.parameters },
+}));
+
+function safeParseJson(raw) {
+  try { return JSON.parse(raw || "{}"); } catch { return {}; }
+}
+
+// Text-in, text-out chat turn — the browser handles speech-to-text and text-to-speech itself
+// (free), this endpoint is just the "brain": it calls Groq's free-tier chat API and runs any
+// tool calls the model asks for, looping until it has a final spoken-language reply.
+app.post("/chat", async (req, res) => {
   try {
-    const instructions = await buildInstructions();
-    const response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        session: {
-          type: "realtime",
-          model: "gpt-realtime-2.1",
-          instructions,
-          audio: {
-            input: {
-              turn_detection: {
-                type: "server_vad",
-                threshold: 0.5,
-                prefix_padding_ms: 250,
-                silence_duration_ms: 400,
-              },
-            },
-            output: { voice: "cedar" },
-          },
-          tools: TOOLS,
-        },
-      }),
-    });
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error("OpenAI /client_secrets error:", errText);
-      return res.status(response.status).send(errText);
+    const { message, history } = req.body;
+    if (!message || typeof message !== "string") {
+      return res.status(400).json({ error: "Missing 'message'." });
     }
-    res.json(await response.json());
+
+    const instructions = await buildInstructions();
+    const messages = [
+      { role: "system", content: instructions },
+      ...(Array.isArray(history) ? history.slice(-20) : []),
+      { role: "user", content: message },
+    ];
+
+    let finalText = null;
+    for (let round = 0; round < 5 && finalText === null; round++) {
+      const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: GROQ_MODEL,
+          messages,
+          tools: GROQ_TOOLS,
+          tool_choice: "auto",
+          temperature: 0.6,
+        }),
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        console.error("Groq /chat/completions error:", errText);
+        return res.status(response.status).send(errText);
+      }
+
+      const data = await response.json();
+      const msg = data.choices?.[0]?.message;
+      if (!msg) throw new Error("No response from model.");
+
+      if (msg.tool_calls && msg.tool_calls.length > 0) {
+        messages.push({ role: "assistant", content: msg.content || null, tool_calls: msg.tool_calls });
+        for (const call of msg.tool_calls) {
+          const args = safeParseJson(call.function.arguments);
+          const result = await executeTool(call.function.name, args);
+          messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+        }
+        continue; // feed the tool results back so the model can give a final answer
+      }
+
+      finalText = msg.content || "";
+    }
+
+    if (finalText === null) {
+      finalText = "Sorry, Sir Yahya — I got stuck processing that. Could you try again?";
+    }
+
+    res.json({ reply: finalText });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Failed to create session" });
+    res.status(500).json({ error: "Failed to get a response." });
   }
 });
 
